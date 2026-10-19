@@ -1,0 +1,11 @@
+{
+  "expected_codes": ["DEAD_VARIABLE"],
+  "workflow": {
+    "id": "wf-backfilled", "name": "Welcome meeting", "status": "draft",
+    "trigger": {"id": "t1", "node_type": "MeetingScheduled", "next": "s1"},
+    "steps": {
+      "s1": {"id": "s1", "node_type": "SendEmail", "params": {"to": "{{PLACEHOLDER.organizer_email}}", "subject": "Meeting {{t1.title}}", "body": "See you there."}}
+    }
+  },
+  "runs": []
+}

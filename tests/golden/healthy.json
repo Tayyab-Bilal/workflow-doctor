@@ -1,0 +1,17 @@
+{
+  "expected_codes": [],
+  "workflow": {
+    "id": "wf-overdue", "name": "Escalate overdue tasks", "status": "active",
+    "trigger": {"id": "t1", "node_type": "TaskOverdue", "next": "c1"},
+    "steps": {
+      "c1": {"id": "c1", "node_type": "FieldEquals", "params": {"field": "priority", "value": "high"}, "on_true": "s_email", "on_false": "s_delay"},
+      "s_email": {"id": "s_email", "node_type": "SendEmail", "params": {"to": "{{t1.owner_email}}", "subject": "Overdue: {{t1.task_title}}", "body": "Please take a look."}},
+      "s_delay": {"id": "s_delay", "node_type": "Delay", "params": {"minutes": 1440}, "next": "s_notify"},
+      "s_notify": {"id": "s_notify", "node_type": "Notify", "params": {"user": "{{t1.project_lead}}", "message": "{{t1.task_title}} is still overdue"}}
+    }
+  },
+  "runs": [
+    {"run_id": "r1", "started_at": "2026-03-01T09:00:00", "status": "succeeded", "executed_step_ids": ["t1", "c1", "s_email"]},
+    {"run_id": "r2", "started_at": "2026-03-02T09:00:00", "status": "succeeded", "executed_step_ids": ["t1", "c1", "s_delay", "s_notify"]}
+  ]
+}

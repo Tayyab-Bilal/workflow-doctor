@@ -1,0 +1,27 @@
+{
+  "expected_codes": ["EMPTY_REQUIRED_PARAM", "ZERO_DELAY", "INVALID_STATUS_PARAM", "STEP_NODE_REMOVED", "UNREACHABLE_STEP", "ALL_RUNS_FAILED"],
+  "workflow": {
+    "id": "wf-onboarding", "name": "Onboarding", "status": "active",
+    "trigger": {"id": "t1", "node_type": "TaskCreated", "next": "s1"},
+    "steps": {
+      "s1": {"id": "s1", "node_type": "CreateTask", "params": {"title": "Welcome {{t1.task_title}}", "project_id": "p-1", "retries": 3}, "next": "s2"},
+      "s2": {"id": "s2", "node_type": "SendEmail", "params": {"to": "", "subject": "Welcome aboard", "body": "Glad you joined."}, "next": "s3"},
+      "s3": {"id": "s3", "node_type": "Delay", "params": {"minutes": 0}, "next": "s4"},
+      "s4": {"id": "s4", "node_type": "UpdateTaskStatus", "params": {"task_id": "{{s1.task_id}}", "status": "finished"}, "next": "s5"},
+      "s5": {"id": "s5", "node_type": "LegacyChatPing", "params": {}},
+      "s9": {"id": "s9", "node_type": "Notify", "params": {"user": "hr", "message": "Orphaned reminder"}}
+    },
+    "built_from": {
+      "source_text": "When a task is created, make a welcome task and email the owner",
+      "as_built_params": {
+        "s1": {"title": "Welcome {{t1.task_title}}", "project_id": "p-1"},
+        "s2": {"to": "{{t1.owner_email}}", "subject": "Welcome aboard", "body": "Glad you joined."}
+      }
+    }
+  },
+  "runs": [
+    {"run_id": "r1", "started_at": "2026-03-01T09:00:00", "status": "failed", "failed_step_id": "s2", "error": "recipient address is empty", "executed_step_ids": ["t1", "s1"]},
+    {"run_id": "r2", "started_at": "2026-03-02T09:00:00", "status": "failed", "failed_step_id": "s2", "error": "recipient address is empty", "executed_step_ids": ["t1", "s1"]},
+    {"run_id": "r3", "started_at": "2026-03-03T09:00:00", "status": "failed", "error": "trigger payload rejected", "executed_step_ids": []}
+  ]
+}
