@@ -6,6 +6,111 @@ Build automation workflows from plain language, and diagnose why existing ones f
 
 > An open-source reference implementation of building and diagnosing automation workflows from plain language. All names and data are fictional.
 
+## At a glance
+
+**What it is.** A small library that builds automation workflows from plain language and diagnoses why existing ones fail. An LLM only reads the request; ordinary code does all the wiring and all the checking.
+
+**What is built.**
+- Build from text or a document: extract, assemble, validate, store as a draft (`builder/build.py: build`, `store.py: build_and_store`, `documents.py: build_from_document`).
+- Graph assembly with fresh ids, branches and variables (`builder/assembler.py: assemble`).
+- Two-tier validation with cycle detection (`builder/validator.py: validate`).
+- 15 deterministic checks in 4 groups, a risk level and per-run forensics (`doctor/checks.py: ALL_CHECKS`, `doctor/diagnose.py: diagnose`, `doctor/forensics.py: run_failures`).
+- Three-way drift (`doctor/drift.py: intent_drift`).
+- Explanation cards with a deterministic fallback (`doctor/narrate.py: narrate`).
+- Agent-facing find, copy, edit, publish and revert (`ops.py`).
+
+**What is not built or simplified.** There is no real LLM or real engine: every LLM sits behind a Protocol with a scripted fake, and the store is synchronous and in memory. Variables are rewritten in top-level string params only. Termination is not checked per branch. See "Limits & known trade-offs" below.
+
+**How it flows.**
+1. A request (or a document turned into text) goes to the extractor together with a summary of the catalog.
+2. The extractor returns an intent: throwaway refs, node types, params and who points where.
+3. The assembler mints real ids and rewrites every pointer and variable.
+4. The validator splits problems into blocking errors and fillable gaps.
+5. The store saves the result as a draft with a record of what was built.
+6. The Doctor later runs its checks on the live workflow and its run history.
+7. Drift compares the live graph with the as-built record and, through a judge, with the original request.
+8. The narrator turns findings into readable cards, or a fallback does it if the narrator is missing or fails.
+
+**Run it.** `.venv/bin/pytest -q` gives 92 passed. `.venv/bin/python examples/demo.py` runs the whole story with no network.
+
+## How each part works, one by one
+
+### 1. The model never writes the graph, code does
+
+- **Risk / problem:** An LLM asked to emit a workflow graph makes up ids and leaves branches pointing at nothing.
+- **How it works:**
+  - The model only returns an intent: short throwaway names, node types, settings and which name points at which. It never produces a real id (`builder/extract.py: Intent`).
+  - Plain code then mints a fresh random id for every step and swaps every throwaway name for it, so any id the model tried to supply is simply ignored (`builder/assembler.py: assemble`).
+  - Placeholders in settings, like the trigger's owner email, are rewritten to point at the new ids too. If the model says "trigger" instead of its own name for the trigger, that still resolves (`model.py: rewrite_variables`).
+  - The first step is wired from the trigger by default, and every other link must be stated, so nothing is joined by a guess.
+  - A simplification: only top-level text settings are rewritten, not nested values.
+- **Tests that prove it:** `tests/test_builder.py`: `test_llm_never_sets_ids`, `test_branches_wired_from_refs`, `test_variables_rewritten_to_step_ids`, and 7 more in that file.
+
+### 2. Unknown things are reported, never faked
+
+- **Risk / problem:** If the model asks for a node the engine does not have, quietly swapping in the nearest real one builds a workflow that does something else.
+- **How it works:**
+  - Every node type is looked up in the engine's catalog. Anything not in it is dropped from the build and listed as unsupported (`builder/assembler.py: assemble`).
+  - If the unknown node had true and false branches, it is reported as an unsupported condition. It is never replaced by one of the allowed conditions.
+  - The extractor is told the catalog up front: allowed values, the allow-list of conditions, trigger payload fields and the variable syntax, so it makes fewer wrong asks (`model.py: catalog_summary`).
+  - A missing setting is never invented. It comes back as a gap for the user to fill (`builder/validator.py: validate`).
+  - The phrase-to-trigger table is checked against the catalog in both directions, so a new engine trigger fails the tests until it is mapped (`triggers.py: TRIGGER_MAP`).
+- **Tests that prove it:** `tests/test_builder.py`: `test_unknown_condition_not_faked`, `test_unknown_node_goes_to_unsupported`, `test_missing_required_param_is_gap_not_error`, and 7 more in that file. `tests/test_grounding.py`: `test_every_mapped_trigger_exists_in_the_catalog`, `test_every_catalog_trigger_is_mapped`, and 8 more in that file.
+
+### 3. Two-tier validation
+
+- **Risk / problem:** One list of problems either blocks half-finished drafts or lets broken graphs through.
+- **How it works:**
+  - Structural problems are errors: no trigger, an id used twice, a pointer to a missing step, a condition without both branches, or a loop. Errors stop the workflow being stored (`builder/validator.py: validate`, `store.py: build_and_store`).
+  - Empty required settings are gaps. They do not block, because the user can still fill them in. The store always creates a draft either way (`store.py: InMemoryStore.create`).
+  - Loops are found by walking the graph and marking each step as in progress or finished. Meeting a step that is still in progress means a loop. Meeting a finished one is just two paths joining, which is allowed (`builder/validator.py: _find_cycle`).
+  - Zero and false count as real values. Only missing, blank or empty values count as empty (`model.py: is_empty`).
+- **Tests that prove it:** `tests/test_validator.py`: `test_cycle_detected_dfs`, `test_self_loop_is_a_cycle`, `test_diamond_is_not_a_cycle`, and 4 more in that file. `tests/test_store.py`: `test_store_forces_draft_even_if_caller_says_active`, `test_gaps_still_create_but_errors_block_creation`, and 3 more in that file.
+
+### 4. Findings point at the exact step
+
+- **Risk / problem:** A diagnosis that says "a Send Email step is broken" blames every email step in the workflow. A flow check that only follows the main chain calls a whole branch unreachable.
+- **How it works:**
+  - There are 15 small checks in four groups: trigger, step and settings, flow, and run health. Each one takes the workflow, the catalog and the run history and returns findings, so each can be tested alone (`doctor/checks.py: CHECK_GROUPS`).
+  - Every finding carries the step id, a message specific to that step, and a fix naming the setting and the value to use.
+  - Reachability walks from the trigger across the next, true and false links, so both sides of a condition count (`model.py: Workflow.walk`).
+  - A placeholder is flagged when the step that produces it is not upstream of the step that reads it. This catches values that look filled in but can never resolve (`doctor/checks.py: dead_variable`).
+  - For each failed run, the Doctor names the step it died on, or says it failed before any step ran. The risk level is the worst finding, bumped one notch up if runs have failed (`doctor/forensics.py: run_failures`, `doctor/diagnose.py: derive_risk`).
+- **Tests that prove it:** `tests/test_checks.py`: `test_gap_matches_exact_step`, `test_reachability_follows_both_branches`, `test_variable_from_downstream_step_is_dead`, and 26 more in that file. `tests/test_diagnose.py`: `test_failure_names_exact_step`, `test_risk_level_derivation`, and 5 more in that file.
+
+### 5. Drift compares only what the builder set
+
+- **Risk / problem:** Engines add default values later. If every extra key counted as a change, healthy workflows would show false drift. Real edits would be buried.
+- **How it works:**
+  - When a workflow is built, a snapshot of its steps and settings is saved with it (`builder/assembler.py: assemble`).
+  - Later, each setting the builder wrote is compared with the live value. Keys the engine added since are ignored, but a key that was removed or changed is reported with its old value (`doctor/drift.py: detect_drift_report`).
+  - Added steps, removed steps, changed node types and changed links are reported too. Steps are matched by id, never by type.
+  - The third leg asks a judge whether the live workflow still does what the original request said. That is the only part that needs an LLM, and it only runs if a judge and a saved request exist (`doctor/drift.py: intent_drift`).
+- **Tests that prove it:** `tests/test_drift.py`: `test_step_removed_added_and_changed_with_as_built_values`, `test_drift_on_the_false_branch_is_found`, `test_steps_of_the_same_type_are_told_apart_by_id`, and 3 more in that file. `tests/test_checks.py`: `test_engine_backfill_is_not_drift`, `test_changed_builder_key_is_drift`, and `test_key_removed_since_build_is_drift`.
+
+### 6. The explanation never depends on the LLM
+
+- **Risk / problem:** If the explanation layer fails or is missing, the user loses the diagnosis.
+- **How it works:**
+  - Findings are produced by plain code first. The narrator only rewrites them into cards with a cause, evidence, numbered fix and impact (`doctor/narrate.py: narrate`).
+  - If the narrator is absent, raises an error or returns nothing, a deterministic fallback builds the same cards straight from the findings (`doctor/narrate.py: fallback_cards`).
+  - The error is logged and swallowed, so the user still gets the full answer.
+- **Tests that prove it:** `tests/test_diagnose.py`: `test_narrator_failure_falls_back`, `test_narrator_output_used_when_it_works`, `test_no_narrator_uses_deterministic_text`.
+
+### 7. Safe operations for an agent
+
+- **Risk / problem:** An agent that edits live workflows in place, or deletes them, can do damage that cannot be undone.
+- **How it works:**
+  - Every operation returns a new object and saves nothing. The caller saves, and the confirm-with-the-user step belongs to the agent, not here (`ops.py: apply_edit`).
+  - Published workflows are immutable. Edits and reverts on them are refused, and there is no delete operation at all (`ops.py: PublishedWorkflowError`).
+  - Publishing runs the validator first and refuses if there is any structural error or empty required setting (`ops.py: publish`).
+  - A copy gets new ids for the workflow and every step, with links and placeholders moved to the new ids, and edits applied in the same call. A link to a step that never existed stays as it was, so a copy of a broken workflow is equally broken (`ops.py: copy_workflow`).
+  - Revert puts back the saved as-built graph, and a proposed drift fix sets each drifted setting back to its old value (`ops.py: revert`, `ops.py: drift_edits`).
+  - Finding by name returns one, several or none. With several it asks, and never picks one (`ops.py: find_by_name`).
+- **Tests that prove it:** `tests/test_ops.py`: `test_apply_edit_refuses_published_workflow`, `test_publish_requires_a_valid_workflow_and_then_blocks_edits`, `test_copy_gets_new_ids_and_rewires_every_link_and_variable`, and 10 more in that file.
+
+(Most of this is also summarised in "Design decisions" below.)
+
 ## The problem
 
 Customers automate processes in a workflow engine: a trigger, then steps, then TRUE/FALSE conditions.
